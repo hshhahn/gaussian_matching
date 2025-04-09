@@ -1,5 +1,11 @@
 from plyfile import PlyData
 import numpy as np
+from sklearn.neighbors import NearestNeighbors
+import torch
+import torch.optim as optim
+from tqdm import tqdm
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class Gaussian:
     def __init__(self):
@@ -9,6 +15,7 @@ class Gaussian:
         self.scales = None
         self.rots = None
         self.sh_base = None
+        self.feature = None
 
     def readGaussian(self, data_path):
         gs_vertex = PlyData.read(data_path)['vertex']
@@ -85,6 +92,74 @@ def quaternion_to_rotation_matrix(q):
         [2 * (q1 * q3 - q0 * q2), 2 * (q2 * q3 + q0 * q1), 1 - 2 * (q1**2 + q2**2)]
     ])
 
+def sample_uniform_quaternions(num_points):
+    """
+    Generates uniformly distributed quaternions for 3D rotations.
+
+    Args:
+        num_points (int): Number of quaternions to sample.
+
+    Returns:
+        np.ndarray: Array of shape (num_points, 4) containing quaternions [q0, q1, q2, q3].
+    """
+    u1 = np.random.uniform(0, 1, num_points)
+    u2 = np.random.uniform(0, 1, num_points)
+    u3 = np.random.uniform(0, 1, num_points)
+
+    q0 = np.sqrt(1 - u1) * np.sin(2 * np.pi * u2)
+    q1 = np.sqrt(1 - u1) * np.cos(2 * np.pi * u2)
+    q2 = np.sqrt(u1) * np.sin(2 * np.pi * u3)
+    q3 = np.sqrt(u1) * np.cos(2 * np.pi * u3)
+
+    quaternions = np.stack((q0, q1, q2, q3), axis=-1)
+    return quaternions
+
+def quaternion_to_rotation_matrix_torch(q):
+    """Converts a (normalized) quaternion q=[q0,q1,q2,q3] to a 3x3 rotation matrix (PyTorch)."""
+    q0, q1, q2, q3 = q
+    return torch.tensor([
+        [1 - 2*(q2**2 + q3**2), 2*(q1*q2 - q0*q3),     2*(q1*q3 + q0*q2)],
+        [2*(q1*q2 + q0*q3),     1 - 2*(q1**2 + q3**2), 2*(q2*q3 - q0*q1)],
+        [2*(q1*q3 - q0*q2),     2*(q2*q3 + q0*q1),     1 - 2*(q1**2 + q2**2)]
+    ], dtype=torch.float32)
+
+def apply_transform(gaussian, quarternion, translation):
+    """
+    Applies a transformation to the Gaussian object.
+    
+    Args:
+        gaussian (Gaussian): The Gaussian object to transform.
+        quarternion (np.ndarray): The quaternion representing the rotation.
+        translation (np.ndarray): The translation vector.
+    """
+    # Convert quaternion to rotation matrix
+    rotation_matrix = quaternion_to_rotation_matrix(quarternion)
+    
+    # Apply rotation and translation
+    gaussian.centroids = np.dot(gaussian.centroids, rotation_matrix.T) + translation
+    gaussian.rots = np.array([quaternion_multiply(quarternion, r) for r in gaussian.rots])
+    gaussian.rots = np.array([normalize_quaternion(r) for r in gaussian.rots])
+    
+    return gaussian
+
+def loss_fn_torch(gaussian1, gaussian2, q, t):
+    q_norm = q / (q.norm() + 1e-9)
+    R = quaternion_to_rotation_matrix_torch(q_norm).to(q.device)  # Move rotation matrix to GPU
+
+    g1_centers_torch = torch.from_numpy(gaussian1.centroids).float().to(q.device)
+    g1_feat_torch = torch.from_numpy(gaussian1.feature).float().to(q.device)
+    g2_centers_torch = torch.from_numpy(gaussian2.centroids).float().to(q.device)
+    g2_feat_torch = torch.from_numpy(gaussian2.feature).float().to(q.device)
+
+    g1_transformed = (g1_centers_torch @ R.T) + t
+
+    dist_matrix = torch.cdist(g1_transformed, g2_centers_torch)  # [N1, N2]
+    distances, indices = dist_matrix.min(dim=1)
+
+    geo_loss = distances.sum()
+    feature_loss = torch.sum((g1_feat_torch - g2_feat_torch[indices]) ** 2)
+    return geo_loss + feature_loss
+
 # Example usage
 cup1 = Gaussian()
 cup1.readGaussian('cup/test/cup_0082/point_cloud.ply')
@@ -93,16 +168,53 @@ cup2 = Gaussian()
 cup2.readGaussian('cup/test/cup_0096/point_cloud.ply')
 
 # Rotate the `rots` attribute of cup2 using an input quaternion
-input_rotation = np.array([0.707, 0.707, 0, 0])  # Example input quaternion (90 degrees around X-axis)
-input_rotation = normalize_quaternion(input_rotation)  # Normalize the input quaternion
+input_rotation = np.array([0.707, 0.3, 0.2, 0])  # Example input quaternion (90 degrees around X-axis)
+cup_2 = apply_transform(cup2, input_rotation, np.array([0, 0, 0]))
 
-# Convert the input quaternion to a rotation matrix
-rotation_matrix = quaternion_to_rotation_matrix(input_rotation)
+# Align center of Mass
+cup1.centroids -= np.mean(cup1.centroids, axis=0)
+cup2.centroids -= np.mean(cup2.centroids, axis=0)
 
-# Rotate centroids of cup2
-cup2.centroids = np.dot(cup2.centroids, rotation_matrix.T)
+#Extract features by simply concatenating 
+cup1.feature = np.concatenate((cup1.opacity, cup1.scales, cup1.rots), axis=1)
+cup2.feature = np.concatenate((cup2.opacity, cup2.scales, cup2.rots), axis=1)
 
-# Apply the input rotation to all quaternions in cup2.rots
-for i in range(cup2.rots.shape[0]):
-    cup2.rots[i] = quaternion_multiply(input_rotation, cup2.rots[i])
-    cup2.rots[i] = normalize_quaternion(cup2.rots[i])  # Normalize the result
+sample_cnt = 100
+sampled_quaternions = sample_uniform_quaternions(sample_cnt)
+opt_iter = 1000
+q_list = []
+t_list = []
+loss_list = []
+
+
+for i in tqdm(range(sample_cnt), desc="Quaternion Samples"):
+    q = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32, device=device, requires_grad=True)
+    t = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device=device, requires_grad=True)
+    optimizer = optim.Adam([q, t], lr=1e-2)
+
+    cup1_temp = Gaussian()
+    cup1_temp.readGaussian('cup/test/cup_0082/point_cloud.ply')
+    cup1_temp = apply_transform(cup1_temp, sampled_quaternions[i], np.array([0, 0, 0]))  # This part is CPU-based
+    cup1_temp.feature = np.concatenate((cup1_temp.opacity, cup1_temp.scales, cup1_temp.rots), axis=1)
+
+    for step in range(opt_iter):
+        optimizer.zero_grad()
+        loss_val = loss_fn_torch(cup1_temp, cup2, q, t)
+        loss_val.backward()
+        optimizer.step()
+
+    q_list.append(q.detach().cpu().numpy())
+    t_list.append(t.detach().cpu().numpy())
+    loss_list.append(loss_val.item())
+
+#find minimum loss
+min_loss_idx = np.argmin(loss_list)
+best_q = quaternion_multiply(q_list[min_loss_idx], sampled_quaternions[min_loss_idx])
+best_q = normalize_quaternion(best_q)
+best_t = t_list[min_loss_idx]
+final_cup_1 = apply_transform(cup1, best_q, best_t)
+
+#save the transformed cup1 as a new PLY file (only centroids)
+output_path = 'cup/test/cup_0082/point_cloud_transformed.ply'
+final_cup_1.centroids = final_cup_1.centroids.astype(np.float32)
+    
