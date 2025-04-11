@@ -22,6 +22,7 @@ def save_points_as_ply(points, ply_path):
     # Create a PlyElement and write
     ply_el = PlyElement.describe(verts_np, 'vertex')
     PlyData([ply_el], text=False).write(ply_path)
+    
 
 class Gaussian:
     """
@@ -85,6 +86,18 @@ class Gaussian:
         self.sh_base = torch.stack([dc0, dc1, dc2], dim=-1).to(device)
 
         return self
+
+    def __getitem__(self, index):
+        return {
+            'centroids': self.centroids[index],
+            'opacity': self.opacity[index],
+            'scales': self.scales[index],
+            'rots': self.rots[index],
+            'normals': self.normals[index],
+            'sh_base': self.sh_base[index],
+            'feature': self.feature[index]
+        }
+
 
 def quaternion_multiply_torch(q1, q2):
     """
@@ -193,6 +206,7 @@ def apply_transform_torch(centroids, rots, q, t):
     return new_centroids, new_rots
 
 def loss_fn_torch(gaussian1, gaussian2, q, t):
+    
     """
     gaussian1, gaussian2 are Gaussian objects with
     gaussian1.centroids, gaussian1.feature as Tensors on device
@@ -219,6 +233,32 @@ def loss_fn_torch(gaussian1, gaussian2, q, t):
     feat_loss = torch.sum((g1_feat - g2_feat)**2)
 
     return geo_loss + lambda_ * feat_loss
+
+def get_gaussian_value(point, gaussian):
+    """
+    point: [3] – point in 3D space
+    gaussian - single gaussian
+    Returns the value of the Gaussian at the given point.
+    """
+    # Compute distance from point to each centroid
+    distances = torch.norm(point - gaussian.centroids, dim=1)
+    
+    # Compute Gaussian value using opacity and scales
+    values = gaussian.opacity * torch.exp(-distances / (2 * gaussian.scales**2))
+    
+    return values
+
+def gaussian_descriptor_field(gaussian1, gaussian2, nearest_k=5):
+    # For each point in gaussian1, find k nearest points in gaussian2
+    dist_matrix = torch.cdist(gaussian1.centroids, gaussian2.centroids)  # Shape: [N1, N2]
+
+    # Find the indices of the k-nearest neighbors in gaussian2 for each point in gaussian1
+    _, knn_indices = torch.topk(dist_matrix, nearest_k, dim=1, largest=False)  # Shape: [N1, k]
+
+    # Gather the features of the k-nearest neighbors
+    descriptor_field = torch.gather(gaussian2.feature, 0, knn_indices.unsqueeze(-1).expand(-1, -1, gaussian2.feature.size(1)))
+    
+
 
 ########################### Main Code #############################
 # Align obj 1 into obj 2 (Find Transform)
